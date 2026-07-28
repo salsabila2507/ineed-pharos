@@ -59,7 +59,8 @@ Each task is stored as an on-chain struct keyed by a monotonically increasing `t
 | maxParticipants | uint256 | Max acceptances (0 = unlimited) |
 | participantCount | uint256 | Current number of accepted participants |
 | submissionCount | uint256 | Current number of submissions received |
-| creatorFeeBps | uint16 | Platform fee in basis points (e.g. 250 = 2.5%) |
+| feeBps | uint16 | Platform fee in basis points snapshot at task creation (e.g. 200 = 2%) |
+| feeTreasury | address | Treasury address snapshot at task creation |
 
 ### Escrow Struct
 
@@ -70,7 +71,7 @@ Separate escrow tracking per task for accounting transparency.
 | totalAmount | uint256 | Amount initially deposited |
 | releasedAmount | uint256 | Total paid out to winner(s) |
 | refundedAmount | uint256 | Total returned to creator |
-| platformFee | uint256 | Fee deducted on release or refund |
+| feeCollected | uint256 | Total platform fee collected from this task |
 
 ### Participant Tracking
 
@@ -159,9 +160,10 @@ struct Submission {
 1. Winner selection runs (creator picks or auto-timeout resolves)
 2. The single winner's address is recorded on-chain
 3. Creator (or system) calls `release(taskId)`
-4. Contract transfers `totalAmount - platformFee` to the winner
-5. `platformFee` is transferred to the platform fee treasury
-6. Task status moves to Completed
+4. Contract computes `fee = calculateFee(task.rewardTotal)`
+5. Contract transfers `rewardTotal - fee` to the winner
+6. Contract transfers `fee` to the treasury
+7. Task status moves to Completed
 
 **Edge cases**:
 - If only one participant submitted, that participant is the sole candidate
@@ -180,15 +182,21 @@ rewardConfig = abi.encode(
 
 **Flow for equal split**:
 1. N winners are selected
-2. `rewardPerWinner = (totalAmount - platformFee) / N`
-3. Contract iterates winner addresses, transfers `rewardPerWinner` to each
-4. Any remainder (due to integer division) stays in contract or goes to platform
+2. `fee = calculateFee(task.rewardTotal)`
+3. `payoutPool = task.rewardTotal - fee`
+4. `rewardPerWinner = payoutPool / N`
+5. Contract iterates winner addresses, transfers `rewardPerWinner` to each
+6. Any remainder (due to integer division) stays in contract or goes to platform
+7. `fee` is transferred to treasury
 
 **Flow for weighted split**:
 1. N winners are selected with assigned weights
-2. `weightSum = sum(weights)`
-3. Each winner receives `(totalAmount - platformFee) * weight_i / weightSum`
-4. Residual dust is allocated to the last winner or platform
+2. `fee = calculateFee(task.rewardTotal)`
+3. `payoutPool = task.rewardTotal - fee`
+4. `weightSum = sum(weights)`
+5. Each winner receives `payoutPool * weight_i / weightSum`
+6. Residual dust is allocated to the last winner or platform
+7. `fee` is transferred to treasury
 
 **Guard conditions**:
 - `numWinners ≤ submissionCount`
@@ -239,11 +247,84 @@ rewardConfig = abi.encode(
 4. Contract automatically executes the configured default action
 5. Task moves to Completed (or Cancelled for Refund)
 
+**Fee handling per action**:
+- `PayAll`: fee is deducted from total, remaining pool split equally among submitters
+- `Refund`: full balance returned to creator, no fee deducted
+- `FirstSubmission`: fee is deducted, remaining amount sent to earliest submitter
+
 **Security**: `autoResolve` is permissionless — any address can trigger it. This prevents funds from being permanently locked if the creator goes offline.
 
 ---
 
-## 6. Deposit Flow
+## 6. Platform Fee System
+
+### Fee Model
+
+- Fee is deducted **only on successful reward release** (not on refund)
+- Winner receives the reward **after** fee deduction
+- Treasury receives the collected fee in the same transaction
+
+### Example
+
+```
+Task reward: 100 USDC
+Platform fee (2%): 2 USDC
+Winner receives: 98 USDC
+Treasury receives: 2 USDC
+```
+
+### Global Configuration
+
+Stored as contract-level state, adjustable by admin.
+
+| Parameter | Type | Default | Max | Description |
+|---|---|---|---|---|
+| `feeBps` | uint16 | 200 | 1000 | Platform fee in basis points (200 = 2%) |
+| `feeTreasury` | address | deployer | — | Address that collects all platform fees |
+| `maxFeeBps` | uint16 | 1000 | 1000 | Absolute ceiling (1000 bps = 10%), immutable |
+
+### Guards
+
+- `feeBps ≤ maxFeeBps` — enforced on every update
+- `maxFeeBps` is set at deploy time and **never changes**
+- `feeTreasury` must be a non-zero address
+- Fee percentage is snapshotted into each `Task` struct at creation — changing the global fee later never affects already-funded tasks
+
+### Admin Functions (abstract)
+
+```solidity
+function setFeeBps(uint16 newFeeBps) external;
+
+function setFeeTreasury(address newTreasury) external;
+```
+
+### Fee Update Rules
+
+- `setFeeBps`: admin only; reverts if `newFeeBps > maxFeeBps`
+- `setFeeTreasury`: admin only; reverts if `newTreasury == address(0)`
+- Changes apply to newly created tasks only — existing tasks retain their snapshotted fee
+
+### Fee Calculation
+
+```solidity
+function calculateFee(uint256 amount) public view returns (uint256) {
+    return amount * feeBps / 10000;
+}
+```
+
+The fee is always calculated as a proportion of the **total reward at task creation**, not the released amount. This ensures deterministic accounting regardless of how many winners are paid.
+
+### Fee Distribution During Release
+
+1. Compute `fee = calculateFee(task.rewardTotal)`
+2. Compute `payoutPool = task.rewardTotal - fee`
+3. Distribute `payoutPool` among winner(s) according to reward model
+4. Transfer `fee` to `task.feeTreasury`
+5. Emit `PlatformFeeCollected(taskId, fee, feeTreasury)`
+
+---
+
+## 7. Deposit Flow
 
 ### Sequence
 
@@ -278,26 +359,31 @@ function deposit(uint256 taskId) external payable;
 
 - `createTask`: `rewardTotal > 0`, `deadline > block.timestamp`
 - `deposit`: `msg.value == task.rewardTotal`, caller is `task.creator`, task is in Created state
-- Platform fee is calculated at deposit time (percentage of `rewardTotal`)
+- At creation, the current global `feeBps` and `feeTreasury` are snapshotted into the task — subsequent fee config changes do not affect this task
 
 ---
 
-## 7. Release Flow
+## 8. Release Flow
 
 ### Sequence
 
 ```
-Creator                     iNeedEscrow                 Winner(s)
-   │                             │                          │
-   │  1. selectWinners(id, [])  │                          │
-   │────────────────────────────►│  Marks isWinner flags   │
-   │                             │                          │
-   │  2. release(taskId)         │                          │
-   │────────────────────────────►│                          │
-   │                             │── transfer(winner) ────►│
-   │                             │── transfer(platformFee) │
-   │                             │  Emits RewardReleased   │
-   │                             │  Status → Completed     │
+Creator                     iNeedEscrow                 Winner(s)         Treasury
+   │                             │                          │                 │
+   │  1. selectWinners(id, [])  │                          │                 │
+   │────────────────────────────►│  Marks isWinner flags   │                 │
+   │                             │                          │                 │
+   │  2. release(taskId)         │                          │                 │
+   │────────────────────────────►│                          │                 │
+   │                             │  Calculate fee           │                 │
+   │                             │  payoutPool = total - fee│                 │
+   │                             │                          │                 │
+   │                             │── transfer(winnerAmt) ──►│                 │
+   │                             │                          │                 │
+   │                             │── transfer(fee) ────────────────────────►│
+   │                             │  Emit RewardReleased     │                 │
+   │                             │  Emit PlatformFeeCollected               │
+   │                             │  Status → Completed     │                 │
 ```
 
 ### Function Signature (abstract)
@@ -312,16 +398,34 @@ function selectWinners(
 function release(uint256 taskId) external;
 ```
 
+### Release Internal Logic
+
+```
+1. fee = calculateFee(task.rewardTotal)
+2. payoutPool = task.rewardTotal - fee
+3. For single winner:
+     winnerAmount = payoutPool
+     transfer(winner, winnerAmount)
+4. For multiple winners (equal):
+     winnerAmount = payoutPool / numWinners
+     for each winner: transfer(winner, winnerAmount)
+5. For multiple winners (weighted):
+     for each winner: transfer(winner, payoutPool * weight_i / weightSum)
+6. transfer(task.feeTreasury, fee)
+7. task.status = Completed
+```
+
 ### Validation
 
 - `selectWinners`: caller is creator, task in Review state, all addresses are valid submitters
-- `release`: winners selected, task in Review or Completed (pending payout) state, not disputed
+- `release`: winners selected, task in Review state, not disputed
 - Cannot release more than the locked balance
-- Platform fee deducted and sent to treasury before winner payouts
+- Payout must leave enough balance for the platform fee
+- Fee is sent to the treasury address snapshotted in the task
 
 ---
 
-## 8. Refund Flow
+## 9. Refund Flow
 
 ### Sequence
 
@@ -331,8 +435,7 @@ Creator                     iNeedEscrow
    │  refund(taskId)             │
    │────────────────────────────►│
    │                             │  Validate cancellable state
-   │                             │  Deduct platform fee
-   │                             │  Transfer remainder to creator
+   │                             │  Transfer full balance to creator
    │                             │  Emit TaskRefunded
    │◄────────────────────────────│  Status → Cancelled
 ```
@@ -357,12 +460,11 @@ function refund(uint256 taskId) external;
 
 - Caller is task creator
 - Task is in Funded or Open state (no participant has accepted)
-- Platform fee (if any) is deducted from refund amount
-- Remaining balance transferred to creator
+- Full balance transferred to creator (no fee deducted on refund)
 
 ---
 
-## 9. Dispute and Admin Resolution
+## 10. Dispute and Admin Resolution
 
 ### Dispute Lifecycle
 
@@ -389,13 +491,23 @@ function resolveDispute(
 ) external;
 ```
 
+### Fee Handling During Dispute
+
+Dispute resolution follows the same fee model as successful release:
+
+- **Payout to participant**: fee is deducted from the paid amount, treasury receives the fee
+- **Refund to creator**: full balance returned, no fee deducted
+- **Split**: fee is deducted from the participant's portion only
+
+This ensures the platform fee is never applied to refunds — only to work that is ultimately rewarded.
+
 ### DisputeRuling Enum
 
-| Ruling | Effect |
-|---|---|
-| `InFavorOfParticipant` | Release specified amount to participant(s) |
-| `InFavorOfCreator` | Refund remaining balance to creator |
-| `Split` | Partial payout to participant, partial refund to creator |
+| Ruling | Effect | Fee Applied? |
+|---|---|---|
+| `InFavorOfParticipant` | Release specified amount to participant(s) | Yes |
+| `InFavorOfCreator` | Refund remaining balance to creator | No |
+| `Split` | Partial payout to participant, partial refund to creator | Yes, on payout portion only |
 
 ### Access Control
 
@@ -410,7 +522,7 @@ function resolveDispute(
 
 ---
 
-## 10. Events List
+## 11. Events List
 
 All events emitted by `iNeedEscrow`.
 
@@ -423,7 +535,7 @@ All events emitted by `iNeedEscrow`.
 | `ReviewStarted` | `taskId`, `deadline` | Task enters Review state |
 | `WinnerSelected` | `taskId`, `winners[]`, `method` | `selectWinners()` called |
 | `RewardReleased` | `taskId`, `recipient`, `amount` | Per-recipient transfer in `release()` |
-| `PlatformFeeCollected` | `taskId`, `amount`, `treasury` | Fee deducted during release or refund |
+| `PlatformFeeCollected` | `taskId`, `amount`, `treasury` | Fee deducted during successful reward release |
 | `TaskRefunded` | `taskId`, `amount`, `recipient` | `refund()` called |
 | `DisputeRaised` | `taskId`, `participant`, `evidence` | `raiseDispute()` called |
 | `DisputeResolved` | `taskId`, `ruling`, `amount` | `resolveDispute()` called |
@@ -432,54 +544,58 @@ All events emitted by `iNeedEscrow`.
 
 ---
 
-## 11. Security Considerations
+## 12. Security Considerations
 
-### 11.1 Reentrancy
+### 12.1 Reentrancy
 
 - All external calls (transfers) happen at the end of functions (checks-effects-interactions pattern)
 - Use Solidity `ReentrancyGuard` for `release()`, `refund()`, and `resolveDispute()`
 - `msg.value` is credited immediately on deposit — no callback risk at deposit time
 
-### 11.2 Integer Overflow / Underflow
+### 12.2 Integer Overflow / Underflow
 
 - Solidity 0.8+ has built-in overflow checking
 - Division in equal-split reward calculation: check `numWinners > 0` before dividing
 - Weighted split: check `weightSum > 0`, handle dust accumulation
 
-### 11.3 Access Control
+### 12.3 Access Control
 
 | Role | Addresses | Protected Functions |
 |---|---|---|
 | **Creator** | Single address per task | `deposit`, `selectWinners`, `release`, `refund` |
 | **Participant** | Addresses that called `accept` | `submit`, `raiseDispute` |
-| **Admin** | Set at deploy, multisig-controlled | `resolveDispute`, emergency pause |
+| **Admin** | Set at deploy, multisig-controlled | `resolveDispute`, `setFeeBps`, `setFeeTreasury`, emergency pause |
 | **Anyone** | Public | `accept`, `autoResolve` (after deadline) |
 
-### 11.4 Front-Running
+### 12.4 Front-Running
 
 - `selectWinners`: commit-reveal pattern is not used for MVP — creator selection is trusted.
 - `autoResolve`: permissionless by design, no advantage to front-running.
 - `accept`: race condition possible if `maxParticipants` is small. Accept in same block — first tx wins.
 
-### 11.5 Fund Locking Prevention
+### 12.5 Fund Locking Prevention
 
 - `autoResolve` ensures funds cannot be permanently stuck if creator goes inactive
 - Maximum review window is enforced on-chain (cannot be infinite)
 - Admin `resolveDispute` provides last-resort override
 
-### 11.6 Platform Fee Safety
+### 12.6 Platform Fee Safety
 
-- Fee deducted before winner payout or refund — winner/creator always receives `totalAmount - fee`
-- Fee calculated in basis points at task creation time (immutable for that task)
-- Fee treasury address set at deploy, changeable via multisig with timelock
+- Fee deducted **only on successful reward release** — refunds return the full balance to creator
+- Global `maxFeeBps` (1000 bps = 10%) is set at deploy and is **immutable** — admin can never exceed this ceiling
+- `setFeeBps` enforces `newFeeBps ≤ maxFeeBps` or the transaction reverts
+- Fee percentage is **snapshotted** into each `Task` struct at creation — changing the global fee later has no effect on already-funded tasks
+- `feeTreasury` must be a non-zero address; setting zero address reverts
+- Fee is calculated deterministically from `task.rewardTotal`, not from dynamic balance — prevents manipulation via partial releases
+- Fee collection happens in the same transaction as winner payout — atomic: either both succeed or both revert
 
-### 11.7 Denial of Service
+### 12.7 Denial of Service
 
 - `participants[]` and `submissions[]` arrays are bounded by `maxParticipants`
 - `release()` iterates over winner array — checked for reasonable upper bound in MVP
 - Gas limit consideration: winner payout loops should have a practical limit (e.g. 50 winners max)
 
-### 11.8 Upgrade & Migration
+### 12.8 Upgrade & Migration
 
 - MVP contract is immutable (no proxy)
 - If critical bug is found, admin can pause new task creation
