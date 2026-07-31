@@ -1,0 +1,25 @@
+{
+  "network": "Pharos Atlantic Testnet",
+  "chainId": 688689,
+  "contract": "iNeedEscrowV2",
+  "address": "0x27D17774B2aeCe56C41140cFf99894Be36Ac661e",
+  "deployer": "0xaa2db706d3864751ea2879f141a3d2A626da3cF6",
+  "treasury": "0xaa2db706d3864751ea2879f141a3d2A626da3cF6",
+  "tokens": {
+    "ZERO_ADDRESS": "0x0000000000000000000000000000000000000000",
+    "MockUSDC": "0x396b9B29E9D98EC8630dCEa9B528c785AFE916FA",
+    "USDC": "0xE0BE08c77f415F577A1B3A9aD7a1Df1479564ec8"
+  },
+  "v1": {
+    "contract": "iNeedEscrow",
+    "address": "0x1c169071cB32033c13305902704E5A0C6c658C89",
+    "transactionHash": "0x3e7bca704b7cae67bfbf537f67bb2583b73b35e4c483919cc89af18b5518be5f",
+    "blockNumber": 27165611,
+    "gasUsed": 3075681,
+    "gasPriceGwei": 10,
+    "deployedAt": "2026-07-28T23:35:30Z"
+  },
+  "admin": "0xaa2db706d3864751ea2879f141a3d2A626da3cF6",
+  "feeBps": 200,
+  "maxFeeBps": 1000
+}

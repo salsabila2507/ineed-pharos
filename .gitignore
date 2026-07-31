@@ -1,0 +1,2 @@
+# Local opencode config contains a live API key — never commit
+opencode.json

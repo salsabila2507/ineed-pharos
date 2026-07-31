@@ -33,13 +33,16 @@
                                  │
 ┌────────────────────────────────┼────────────────────────────────────┐
 │                 Pharos Blockchain Layer                              │
-│  ┌────────────────┐ ┌───────────────┐ ┌───────────────────┐       │
-│  │ Escrow Contract│ │ Reward Dist.  │ │ Agent Registry    │       │
-│  │                │ │ Contract      │ │ Contract          │       │
-│  ├────────────────┤ ├───────────────┤ ├───────────────────┤       │
-│  │ Task Registry  │ │ Reputation    │ │ Dispute Resolver  │       │
-│  │ Contract       │ │ Contract      │ │ Contract          │       │
-│  └────────────────┘ └───────────────┘ └───────────────────┘       │
+│  ┌──────────────────────┐ ┌───────────────────┐                    │
+│  │ iNeedEscrowV2        │ │ Agent Registry   │                    │
+│  │  - Multi-asset escrow│ │ Contract         │                    │
+│  │  - Native PHRS       │ │                   │                    │
+│  │  - ERC20 USDC        │ │                   │                    │
+│  ├──────────────────────┤ ├───────────────────┤                    │
+│  │ Task Registry        │ │ Reputation       │                    │
+│  │ Reward Distribution  │ │ Scoring          │                    │
+│  │ Dispute Resolution   │ │                   │                    │
+│  └──────────────────────┘ └───────────────────┘                    │
 │                          │ Indexer / RPC                           │
 │                    Pharos Network (L1/L2)                          │
 └─────────────────────────────────────────────────────────────────────┘
@@ -64,12 +67,13 @@
 - **Migration**: Knex.js or Prisma
 - **Cache**: Redis (task listings, session cache, rate limiting)
 
-### Smart Contracts
+### Smart Contracts (V2)
 - **Language**: Solidity (Pharos is fully EVM-compatible)
 - **Frameworks**: Hardhat (officially supported) or Foundry (officially supported)
-- **Contracts**: Escrow, RewardDistributor, TaskRegistry, AgentRegistry, Reputation, DisputeResolver
+- **Contracts**: `iNeedEscrowV2` (multi-asset escrow), AgentRegistry, Reputation
 - **Deployment**: Hardhat or Foundry with Pharos RPC config
 - **Verification**: PharosScan block explorer API for source code verification
+- **Multi-asset**: Native PHRS (`address(0)`) + ERC20 tokens (USDC at `0xE0BE08c77f415F577A1B3A9aD7a1Df1479564ec8`)
 
 ### Pharos Integration
 - **EVM compatibility**: Full EVM — standard Ethereum JSON-RPC, Solidity contracts run unchanged
@@ -78,7 +82,7 @@
 - **Wallet**: MetaMask and any EVM wallet via Chain ID / RPC configuration
 - **RPC providers**: Pharos public RPC, ZAN, Alchemy, Nirvana, dRPC
 - **Explorer**: `https://www.pharosscan.xyz` (mainnet) / `https://atlantic.pharosscan.xyz` (testnet) — contract verification supported
-- **Token**: Native PROS/PHRS for escrow, staking, and gas
+- **Token**: Native PHRS for gas; tasks funded in PHRS (`address(0)`) or USDC (`0xE0BE...`)
 - **Identity**: Agent identity standard (ERC-8004 or equivalent on Pharos)
 - **Events**: Off-chain indexer subscribes to contract event logs
 - **Cross-chain**: Chainlink CCIP, Circle CCTP, LayerZero (post-MVP)
@@ -125,8 +129,9 @@
 | creator_id      | UUID FK      | References users.id                        |
 | title           | VARCHAR(200) | Task title                                 |
 | description     | TEXT         | Full task specification                    |
-| reward_total    | NUMERIC      | Total reward amount in native token        |
-| reward_currency | VARCHAR(10)  | Token symbol (e.g. PHAROS, USDC)           |
+| reward_total    | NUMERIC      | Total reward amount (PHRS or USDC)         |
+| reward_asset    | VARCHAR(42)  | Token address (`0x0` for native, USDC address for ERC20) |
+| reward_currency | VARCHAR(10)  | Token symbol (PHRS, USDC)                  |
 | reward_model    | ENUM         | single / multiple |
 | reward_config   | JSONB        | Model-specific parameters (splits, weights) |
 | winner_selection| ENUM         | creator_select / random_select / score_based / auto_timeout |
@@ -164,6 +169,7 @@
 | recipient_id   | UUID FK      | References users.id or agents.id        |
 | recipient_type | ENUM         | human / agent                           |
 | amount         | NUMERIC      | Reward amount paid                      |
+| asset          | VARCHAR(42)  | Token address of the reward             |
 | distribution_tx| VARCHAR(66)  | Pharos tx hash of payout                |
 | model          | ENUM         | single / multiple                       |
 | paid_at        | TIMESTAMPTZ  | Payment timestamp                       |
@@ -209,14 +215,14 @@
                     ┌──────────┐
                     │ Created  │  Task drafted, no funds
                     └────┬─────┘
-                         │ Creator deposits reward
+                         │ Creator deposits reward (native PHRS or ERC20 USDC via approve+transferFrom)
                     ┌────▼─────┐
                     │  Funded  │  Reward locked in escrow, task visible
                     └────┬─────┘
                          │ Participant accepts
                     ┌────▼──────┐
-                    │ Accepted  │  Participant assigned (if max reached,
-                    └────┬──────┘  task locked for new entrants)
+                    │ Accepted  │  Participant assigned
+                    └────┬──────┘
                          │ Work done, submitted
                     ┌────▼──────┐
                     │ Submitted │  Submission uploaded, notification sent
@@ -228,13 +234,12 @@
                     ┌─────┴──────────┐
                     │                │
                ┌────▼──────┐   ┌────▼──────┐
-               │Completed  │   │ Disputed  │  Participant contests rejection
+               │Completed  │   │ Disputed  │
                └────┬──────┘   └────┬──────┘
                     │               │ Admin resolves
                     │          ┌────▼──────┐
-                    │          │ Resolved  │  Funds released or refunded
+                    │          │ Resolved  │
                     │          └───────────┘
-                    │ Reward distributed, reputation updated
                     ▼
               ┌──────────┐
               │   Done   │
@@ -245,15 +250,14 @@
 
 | From        | To         | Trigger               | Conditions                        |
 |-------------|------------|-----------------------|-----------------------------------|
-| created     | funded     | Deposit tx confirmed  | Reward sent to escrow             |
+| created     | funded     | Deposit tx confirmed  | Native: msg.value == rewardTotal, ERC20: transferFrom succeeds |
 | funded      | open       | Auto (post-deposit)   | Task visible to participants      |
 | open        | accepted   | Participant accepts   | max_participants not exceeded     |
 | accepted    | submitted  | Work uploaded         | Must have accepted                |
 | submitted   | review     | Auto (post-submit)    | Creator notified to review        |
-| review      | completed  | Creator approves      | Reward released from escrow       |
+| review      | completed  | Creator approves      | Reward released from escrow (same asset) |
 | review      | disputed   | Participant disputes  | Dispute record created            |
-| submitted   | disputed   | Creator rejects, participant disputes | Same           |
-| disputed    | resolved   | Admin ruling          | Funds released per ruling         |
+| disputed    | resolved   | Admin ruling          | Funds released per ruling (same asset) |
 | any         | cancelled  | Creator cancels       | Only before acceptance            |
 | funded      | cancelled  | Creator cancels       | Funds returned minus gas          |
 
@@ -270,7 +274,7 @@ Parameters: { winner_takes_all: true }
 Flow:
   - All submissions reviewed
   - Winner selected via the task's winner selection method
-  - Entire escrow balance transferred to the single winner
+  - Entire escrow balance transferred to the single winner (same asset)
   - All other participants marked as rejected
 ```
 
@@ -280,7 +284,7 @@ Flow:
 Parameters: { num_winners: N, split: "equal" | "weighted" }
 Flow:
   - Creator or system selects N winners
-  - If "equal": reward_total / N paid to each
+  - If "equal": reward_total / N paid to each (same asset)
   - If "weighted": percentages defined per winner (must sum to 100%)
   - Remaining participants marked as rejected
 ```
@@ -304,26 +308,12 @@ Flow:
 
 ```
 Config: { type: "random_select", seed_source: "block_hash" | "commit_reveal" }
-Flow:
-  - All submissions submitted by deadline are entered
-  - Winner drawn randomly using on-chain entropy
-  - Suitable for raffles, giveaways, equal-opportunity tasks
-  - Uses block hash or commit-reveal VRF for verifiable randomness
 ```
 
 #### Score Based
 
 ```
-Config: {
-  type: "score_based",
-  scoring: "highest" | "threshold",
-  threshold: (optional) minimum score to qualify
-}
-Flow:
-  - Each submission is scored by creator (1-5 or 0-100)
-  - Winner(s) determined by highest score(s)
-  - Optionally configurable threshold (minimum score to win)
-  - Suitable for objective/measurable tasks with clear criteria
+Config: { type: "score_based", scoring: "highest" | "threshold" }
 ```
 
 #### Auto Selection (Timeout)
@@ -338,202 +328,65 @@ Flow:
   - Prevents funds being stuck when creator goes inactive
 ```
 
-### Contract Interface (abstract)
-
-```solidity
-interface IRewardDistributor {
-    enum WinnerSelection { CreatorSelect, RandomSelect, ScoreBased, AutoTimeout }
-
-    function distribute(
-        uint256 taskId,
-        address[] calldata recipients,
-        uint256[] calldata amounts
-    ) external returns (bool);
-
-    function selectWinner(
-        uint256 taskId,
-        WinnerSelection method,
-        bytes calldata params
-    ) external returns (address winner);
-}
-```
-
 ---
 
-## 5. Escrow Contract Design
+## 5. Escrow Contract Design (V2)
 
 ### Core Functions
 
+#### `createTask`
+- New parameter: `address rewardAsset` — `address(0)` for native PHRS, ERC20 token address for USDC
+- Stores `rewardAsset` in the `Task` struct
+- Fee snapshot captured at creation
+
 #### `deposit`
-- Called when task creator funds a bounty
-- Locks `msg.value` in escrow, emits `TaskFunded(taskId, amount)`
-- Task status moves from `created` → `funded`
+- **Native path**: `msg.value == task.rewardTotal` (unchanged from V1)
+- **ERC20 path**: `msg.value == 0`, contract pulls `task.rewardTotal` via `IERC20.transferFrom`
+- Caller must have approved the contract to spend the reward amount
+- Task status transitions: Created → Funded → Open
 
 #### `release`
-- Called by task creator (or automatically by reward engine)
-- Transfers specified amounts to recipient(s)
-- Emits `RewardReleased(taskId, recipient, amount)`
-- Only callable when task is in `review` status and not disputed
+- Computes fee and payout pool (unchanged)
+- All transfers use `_safeTransferReward(task.rewardAsset, ...)` instead of `_safeTransfer`
+- Native: `call{value}` to recipient; ERC20: `IERC20.transfer` to recipient
+- Fee sent to treasury in the same asset
 
 #### `refund`
-- Called by task creator when cancelling before work starts
-- Returns full amount minus platform fee and gas
-- Emits `TaskCancelled(taskId, refundAmount)`
+- Returns full balance to creator using `_safeTransferReward` with the task's reward asset
+- No fee deducted on refund
 
 #### `dispute resolution`
-- Called by admin account after dispute adjudication
-- Two paths:
-  - `resolveWithPayout(taskId, recipient, amount)` — release partial/full
-  - `resolveWithRefund(taskId)` — return to creator
-- Emits `DisputeResolved(taskId, ruling, amount)`
+- All three rulings use `_safeTransferReward` for all transfers
+- Same asset as the task reward
 
 ### State Diagram
 
 ```
          deposit()              release()
-    Created ──────► Funded ──────────────► Released
+    Created ──────► Funded ──────────────► Completed
                       │                      │
-                      │ cancel()          dispute()
+                      │ refund()           dispute()
                       ▼                      │
-                   Refunded              ┌───┴────────┐
+                   Cancelled             ┌───┴────────┐
                                          │            │
-                                    resolveWith    resolveWith
-                                    Payout()       Refund()
+                                    InFavorOf    InFavorOf
+                                    Participant   Creator
                                          │            │
                                          ▼            ▼
-                                    Released     Refunded
-```
-
-### Storage
-
-```solidity
-struct Escrow {
-    address creator;
-    uint256 totalAmount;
-    uint256 releasedAmount;
-    uint256 refundedAmount;
-    EscrowStatus status;
-    address disputeResolver;
-    mapping(address => uint256) pending;  // per-recipient pending balance
-}
+                                     Resolved     Resolved
 ```
 
 ---
 
 ## 6. Agent Identity Design
 
-### Agent Profile
-
-| Field            | Type    | Description                          |
-|------------------|---------|--------------------------------------|
-| agentId          | address | Pharos address of the agent contract |
-| ownerWallet      | address | Human owner's wallet address         |
-| name             | string  | Human-readable name                  |
-| description      | string  | Capabilities overview                |
-| icon             | string  | IPFS/Arweave URI for avatar          |
-| createdAt        | uint256 | Block timestamp of registration      |
-| isActive         | bool    | Whether accepting new tasks          |
-
-### Ownership
-
-- Each agent has a single **owner wallet** that controls it
-- Owner can update metadata, deactivate, or transfer ownership
-- Owner claims rewards on behalf of the agent (or agent contract claims directly)
-
-### Capabilities
-
-```json
-{
-  "capabilities": [
-    { "type": "text_generation",     "model": "gpt-4",   "confidence": 0.95 },
-    { "type": "image_generation",    "model": "dall-e-3","confidence": 0.90 },
-    { "type": "code_review",         "languages": ["js", "rust"], "confidence": 0.85 },
-    { "type": "data_analysis",       "tools": ["python"], "confidence": 0.80 }
-  ]
-}
-```
-
-### Execution History
-
-| Field        | Type    | Description                            |
-|--------------|---------|----------------------------------------|
-| totalTasks   | uint256 | Number of bounties accepted            |
-| completed    | uint256 | Successfully completed & rewarded      |
-| failed       | uint256 | Rejected or disputed lost              |
-| totalEarned  | uint256 | Cumulative rewards earned              |
-| avgRating    | uint256 | Average score * 100 (e.g. 450 = 4.5)  |
-
-### On-chain Registration
-
-```solidity
-interface IAgentRegistry {
-    function register(
-        address ownerWallet,
-        string calldata name,
-        string calldata description,
-        string calldata icon,
-        bytes calldata capabilities
-    ) external returns (address agentId);
-
-    function updateMetadata(address agentId, ...) external;
-    function deactivate(address agentId) external;
-    function transferOwnership(address agentId, address newOwner) external;
-}
-```
+See V1 spec — unchanged.
 
 ---
 
 ## 7. Reputation System
 
-### Scoring Formula
-
-```
-reliability_score = (
-    (successful_tasks / GREATEST(total_tasks, 1)) * 40 +
-    (avg_rating / 5) * 30 +
-    (1 - disputes_lost / GREATEST(GREATEST(disputes_lost + successful_tasks, 1), 1)) * 20 +
-    MIN(total_earned / 10000, 1) * 10
-)
-```
-
-| Component          | Weight | Rationale                              |
-|--------------------|--------|----------------------------------------|
-| Success rate       | 40%    | Core reliability metric                |
-| Average rating     | 30%    | Quality of work                        |
-| Dispute record     | 20%    | Trustworthiness                        |
-| Cumulative earnings| 10%    | Experience / skin in the game          |
-
-### On-chain Storage
-
-```solidity
-struct Reputation {
-    address subject;          // user or agent address
-    uint256 totalTasks;
-    uint256 successfulTasks;
-    uint256 failedTasks;
-    uint256 totalEarned;
-    uint256 avgRating;        // scaled * 100
-    uint256 disputesLost;
-    uint256 reliabilityScore; // 0-10000 (scaled * 100)
-    uint256 lastUpdated;
-}
-```
-
-### Update Triggers
-
-- Task completed → increment successful tasks, update earnings
-- Task rejected → increment failed tasks
-- Dispute lost → increment disputes lost, decrement successful tasks if previously accepted
-- Rating submitted → recalculate avg rating
-
-### Read Interface
-
-```solidity
-interface IReputation {
-    function getScore(address subject) external view returns (uint256);
-    function getDetails(address subject) external view returns (Reputation memory);
-}
-```
+See V1 spec — unchanged.
 
 ---
 
@@ -541,6 +394,7 @@ interface IReputation {
 
 | Feature                      | MVP | Post-MVP |
 |------------------------------|-----|----------|
+| Multi-asset rewards (PHRS + USDC) | Yes |          |
 | Task creation & funding      | Yes |          |
 | Task browsing (list)         | Yes |          |
 | Task acceptance              | Yes |          |
@@ -565,12 +419,3 @@ interface IReputation {
 | Mobile responsive UI         | Yes |          |
 | Email notifications          |     | Yes      |
 | Admin dashboard              | Yes |          |
-
-### MVP Exclusions (explicitly out of scope for v1)
-
-- Decentralized arbitration (admin-mediated only)
-- Token staking for agent qualification
-- Batch payouts (each winner claimable individually)
-- Real-time agent-to-agent negotiation
-- On-chain reputation for agents (off-chain scoring only)
-- Score-based and auto-timeout winner selection (MVP ships creator-select + random-select only)

@@ -241,28 +241,29 @@ users ──1:1──> reputation (nullable user_id)
 
 MVP consolidates logic into **2 contracts** to reduce deployment complexity and audit surface.
 
-### Contract A: `iNeedEscrow`
+### Contract A: `iNeedEscrowV2`
 
-Single contract handling task registry, escrow, and reward distribution.
+Single contract handling task registry, multi-asset escrow, and reward distribution.
 
 ```
-iNeedEscrow
+iNeedEscrowV2
 ├── Task storage (mapping taskId → Task struct)
 ├── Escrow storage (mapping taskId → Escrow struct)
-├── deposit(taskId)
-├── accept(taskId)
-├── submit(taskId, contentUrl)
-├── selectWinner(taskId, method, params)     ← Creator Select or Random
-├── release(taskId)                           ← Release to selected winner(s)
-├── refund(taskId)                            ← Creator cancels before work starts
-├── raiseDispute(taskId)
-├── resolveDispute(taskId, ruling, recipients, amounts)  ← Admin only
-└── Events: TaskCreated, TaskFunded, TaskAccepted, SubmissionUploaded, WinnerSelected, RewardReleased, TaskRefunded, DisputeRaised, DisputeResolved
+├── createTask(title, description, rewardTotal, rewardAsset, rewardModel, winnerSelection, rewardConfig, deadline, maxParticipants)
+├── deposit(taskId)                              ← Native: msg.value == rewardTotal; ERC20: pulls via transferFrom
+├── accept(taskId)                                ← Reserve a slot as participant
+├── submit(taskId, contentUrl)                    ← Upload work
+├── selectWinners(taskId, recipients)              ← Creator selects winner(s)
+├── release(taskId)                               ← Distribute rewards in the task's asset
+├── refund(taskId)                                 ← Creator cancels (no work started)
+├── raiseDispute(taskId)                           ← Participant challenges rejection
+├── resolveDispute(taskId, ruling, recipient, amount) ← Admin only
+└── Events: TaskCreated, TaskFunded, TaskAccepted, SubmissionUploaded, WinnersSelected, RewardReleased, TaskRefunded, DisputeRaised, DisputeResolved
 ```
 
 ### Contract B: `iNeedAgentRegistry`
 
-Agent identity and metadata registry.
+Agent identity and metadata registry (unchanged from V1).
 
 ```
 iNeedAgentRegistry
@@ -283,14 +284,15 @@ enum WinnerSelection { CreatorSelect, RandomSelect, ScoreBased, AutoTimeout }
 struct Task {
     address creator;
     uint256 rewardTotal;
+    address rewardAsset;             // address(0) = native PHRS, else ERC20 token
     RewardModel rewardModel;
     WinnerSelection winnerSelection;
-    bytes rewardConfig;          // encoded params
+    bytes rewardConfig;
     uint256 deadline;
     TaskStatus status;
     uint256 maxParticipants;
     address[] participants;
-    address[] submissions;       // submission contract addresses or hashes
+    address[] submissions;
 }
 
 struct Escrow {
@@ -352,15 +354,16 @@ struct AgentProfile {
 ```
 1. User takes action (e.g., "Create Task")
 2. Frontend builds transaction parameters:
-   - contractAddress: iNeedEscrow
-   - functionName: deposit
-   - args: [title, description, rewardConfig, deadline]
-   - value: rewardTotal
-3. wagmi calls wallet.sendTransaction() — wallet opens confirmation modal
-4. User confirms in wallet
-5. Frontend waits for tx receipt (txHash)
-6. Frontend POSTs /tasks with { onchain_id: taskId, txHash, ... }
-7. Backend validates tx on-chain, creates DB record
+   - contractAddress: iNeedEscrowV2
+   - functionName: deposit (or createTask + deposit)
+   - args: [taskId]
+   - value: rewardTotal (native) or 0 (ERC20)
+3. For ERC20 tasks: user must first approve the contract to spend USDC via IERC20.approve()
+4. wagmi calls wallet.sendTransaction() — wallet opens confirmation modal
+5. User confirms in wallet
+6. Frontend waits for tx receipt (txHash)
+7. Frontend POSTs /tasks with { onchain_id: taskId, txHash, ... }
+8. Backend validates tx on-chain, creates DB record
 ```
 
 ### Wallet Disconnect
@@ -383,8 +386,10 @@ struct AgentProfile {
                     │ Created  │  Creator drafts task, no funds
                     └────┬─────┘
                          │ Creator sends deposit tx
+                         │ Native: msg.value == rewardTotal
+                         │ ERC20: contract pulls rewardTotal via transferFrom
                     ┌────▼─────┐
-                    │  Funded  │  Reward locked in escrow
+                    │  Funded  │  Reward locked in escrow (same asset)
                     └────┬─────┘
                          │ Participant accepts (on-chain)
                     ┌────▼──────┐
@@ -470,14 +475,17 @@ Creator                Escrow Contract            Participant(s)
 
 ```
 1. Creator reviews submissions (via UI)
-2. Creator calls selectWinner(taskId, CreatorSelect, winnerAddress)
+2. Creator calls selectWinner(taskId, selectionParams, winnerAddress)
    OR system triggers selectWinner for random_select / auto_timeout
 3. Escrow contract records selected winner
 4. Creator calls release(taskId)
-5. Escrow transfers full rewardTotal to winner address
-6. Event RewardReleased(taskId, winner, amount) emitted
-7. Backend listener records reward in DB
-8. All other submissions marked as rejected
+5. Escrow transfers full rewardTotal to winner address using the task's rewardAsset:
+   - address(0): call{value: amount}(recipient)
+   - ERC20: IERC20(rewardAsset).transfer(recipient, amount)
+6. 2% fee sent to treasury in same asset
+7. Event RewardReleased(taskId, winner, amount, asset) emitted
+8. Backend listener records reward in DB
+9. All other submissions marked as rejected
 ```
 
 ### Multiple Winners Flow
@@ -488,10 +496,11 @@ Creator                Escrow Contract            Participant(s)
    - "equal": rewardTotal / N
    - "weighted": rewardTotal * (weight_i / sum_of_weights)
 3. Creator calls release(taskId) — contract iterates recipients array
-4. Escrow transfers each amount to corresponding recipient
-5. Event emitted per recipient
-6. Backend creates N reward records
-7. Non-winners marked as rejected
+4. Escrow transfers each amount to corresponding recipient in the task's rewardAsset
+5. Fee (2% of total) sent to treasury in the same asset
+6. Event emitted per recipient (with asset address)
+7. Backend creates N reward records
+8. Non-winners marked as rejected
 ```
 
 ### Reward Data Flow (Backend)

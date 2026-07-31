@@ -1,15 +1,22 @@
-# iNeedEscrow — Smart Contract Specification
+# iNeedEscrowV2 — Smart Contract Specification
 
 ## 1. Purpose
 
-`iNeedEscrow` is the core smart contract of the iNeed marketplace. It manages the full lifecycle of a task bounty on-chain: creation with locked funds, participant acceptance, work submission, winner selection, reward distribution, refunds, and dispute resolution.
+`iNeedEscrowV2` is the core smart contract of the iNeed marketplace. It manages the full lifecycle of a task bounty on-chain: creation with locked funds, participant acceptance, work submission, winner selection, reward distribution, refunds, and dispute resolution.
 
 The contract acts as a trustless intermediary — funds are locked at task creation and only released according to predetermined rules or admin resolution. No party can withdraw funds unilaterally outside the defined state transitions.
+
+### What's New in V2
+
+- **Multi-asset rewards**: tasks can be funded in native PHRS (`address(0)`) or ERC20 tokens (e.g. USDC at `0xE0BE08c77f415F577A1B3A9aD7a1Df1479564ec8`)
+- **Asset-aware deposit**: creator deposits via `msg.value` for native or `transferFrom` for ERC20
+- **Asset-aware payouts**: all releases, refunds, and dispute resolutions send the same asset as was deposited
+- **Fee collected in same asset**: treasury receives PHRS or USDC matching the task's reward asset
 
 ### Scope
 
 - Task registry and status tracking
-- Escrow deposit, release, and refund
+- Multi-asset escrow deposit, release, and refund
 - Reward distribution (single winner, multiple winners)
 - Winner selection (creator select, auto timeout)
 - Dispute management with admin override
@@ -49,7 +56,7 @@ Each task is stored as an on-chain struct keyed by a monotonically increasing `t
 | Field | Type | Description |
 |---|---|---|
 | creator | address | Wallet that created and funded the task |
-| rewardTotal | uint256 | Total locked amount in native token (wei) |
+| rewardTotal | uint256 | Total locked amount in reward asset units (wei for native, 6-decimals for USDC) |
 | rewardModel | RewardModel | Single or Multiple |
 | rewardConfig | bytes | Encoded parameters (numWinners, weights, etc.) |
 | winnerSelection | WinnerSelection | Method for selecting winner(s) |
@@ -61,6 +68,9 @@ Each task is stored as an on-chain struct keyed by a monotonically increasing `t
 | submissionCount | uint256 | Current number of submissions received |
 | feeBps | uint16 | Platform fee in basis points snapshot at task creation (e.g. 200 = 2%) |
 | feeTreasury | address | Treasury address snapshot at task creation |
+| winnersSelected | bool | Whether winners have been selected |
+| timeoutAction | AutoTimeoutAction | Fallback action for auto-timeout |
+| rewardAsset | address | `address(0)` = native PHRS, otherwise ERC20 token address |
 
 ### Escrow Struct
 
@@ -102,7 +112,7 @@ struct Submission {
                     ┌─────────────┐
                     │   Created   │  Creator calls createTask()
                     └──────┬──────┘
-                           │ deposit() sent with msg.value
+                           │ deposit() — msg.value (native) or transferFrom (ERC20)
                     ┌──────▼──────┐
                     │   Funded    │  Reward locked, task visible
                     └──────┬──────┘
@@ -137,15 +147,15 @@ struct Submission {
 
 | From | To | Trigger | Guard |
 |---|---|---|---|
-| Created | Funded | `deposit(taskId)` | Must be called by creator; `msg.value == rewardTotal` |
+| Created | Funded | `deposit(taskId)` | Must be called by creator; native: `msg.value == rewardTotal`, ERC20: sufficient allowance |
 | Funded | Open | Automatic in `deposit()` | None |
 | Open | Accepted | `accept(taskId)` | `participantCount < maxParticipants` or maxParticipants == 0 |
 | Open | Cancelled | `refund(taskId)` | Only before any participant accepts |
 | Accepted | Submitted | `submit(taskId, contentHash)` | Caller must be an accepted participant |
 | Submitted | Review | Automatic when deadline passes OR creator calls `startReview(taskId)` | At least one submission exists |
-| Review | Completed | `selectWinner()` + `release()` | Winner(s) selected and funds released |
+| Review | Completed | `selectWinner()` + `release()` | Winner(s) selected and funds released in same asset |
 | Review | Disputed | `raiseDispute(taskId)` | Caller must be a rejected participant |
-| Disputed | Resolved | `resolveDispute(...)` | Admin only; payout or refund |
+| Disputed | Resolved | `resolveDispute(...)` | Admin only; payout or refund in same asset |
 | Review | Completed | Auto timeout triggers `autoResolve(taskId)` | reviewDeadline passed, creator did not act |
 
 ---
@@ -161,8 +171,8 @@ struct Submission {
 2. The single winner's address is recorded on-chain
 3. Creator (or system) calls `release(taskId)`
 4. Contract computes `fee = calculateFee(task.rewardTotal)`
-5. Contract transfers `rewardTotal - fee` to the winner
-6. Contract transfers `fee` to the treasury
+5. Contract transfers `rewardTotal - fee` to the winner (same asset as deposit)
+6. Contract transfers `fee` to the treasury (same asset)
 7. Task status moves to Completed
 
 **Edge cases**:
@@ -195,13 +205,22 @@ rewardConfig = abi.encode(
 3. `payoutPool = task.rewardTotal - fee`
 4. `weightSum = sum(weights)`
 5. Each winner receives `payoutPool * weight_i / weightSum`
-6. Residual dust is allocated to the last winner or platform
+6. Residual dust is allocated to the last winner
 7. `fee` is transferred to treasury
 
 **Guard conditions**:
 - `numWinners ≤ submissionCount`
 - All winner addresses must be unique
 - Must have at least one winner
+
+### Multi-Asset Consistency
+
+All financial operations for a given task use the same asset:
+- **Deposit**: native PHRS via `msg.value`, ERC20 via `transferFrom`
+- **Release**: payout via `_safeTransferReward` which routes to native `call{value}` or `IERC20.transfer`
+- **Refund**: returns the same asset type
+- **Dispute resolution**: all transfers use the task's `rewardAsset`
+- **Fee**: treasury receives the same asset type as the task reward
 
 ---
 
@@ -222,17 +241,12 @@ rewardConfig = abi.encode(
 5. Others remain rejected (eligible for dispute)
 6. Creator then calls `release(taskId)` to execute payout
 
-**Gas optimization**: For tasks with many submissions, creator can submit winner addresses in batches.
-
 ### 5.2 Auto Timeout
 
 **Config**:
 ```solidity
 winnerSelection = AutoTimeout
-rewardConfig = abi.encode(
-    AutoTimeoutAction action,  // PayAll, Refund, FirstSubmission
-    uint256 reviewDeadline     // seconds after submission deadline
-)
+rewardConfig = abi.encode(AutoTimeoutAction action)
 ```
 
 **AutoTimeoutAction enum**:
@@ -262,9 +276,19 @@ rewardConfig = abi.encode(
 
 - Fee is deducted **only on successful reward release** (not on refund)
 - Winner receives the reward **after** fee deduction
-- Treasury receives the collected fee in the same transaction
+- Treasury receives the collected fee in the same asset as the task reward
+- Fee calculation (`amount * feeBps / 10000`) is asset-agnostic — it applies the same percentage to native or ERC20 amounts
 
-### Example
+### Example (Native PHRS)
+
+```
+Task reward: 100 PHRS
+Platform fee (2%): 2 PHRS
+Winner receives: 98 PHRS
+Treasury receives: 2 PHRS
+```
+
+### Example (USDC)
 
 ```
 Task reward: 100 USDC
@@ -290,20 +314,6 @@ Stored as contract-level state, adjustable by admin.
 - `feeTreasury` must be a non-zero address
 - Fee percentage is snapshotted into each `Task` struct at creation — changing the global fee later never affects already-funded tasks
 
-### Admin Functions (abstract)
-
-```solidity
-function setFeeBps(uint16 newFeeBps) external;
-
-function setFeeTreasury(address newTreasury) external;
-```
-
-### Fee Update Rules
-
-- `setFeeBps`: admin only; reverts if `newFeeBps > maxFeeBps`
-- `setFeeTreasury`: admin only; reverts if `newTreasury == address(0)`
-- Changes apply to newly created tasks only — existing tasks retain their snapshotted fee
-
 ### Fee Calculation
 
 ```solidity
@@ -319,28 +329,48 @@ The fee is always calculated as a proportion of the **total reward at task creat
 1. Compute `fee = calculateFee(task.rewardTotal)`
 2. Compute `payoutPool = task.rewardTotal - fee`
 3. Distribute `payoutPool` among winner(s) according to reward model
-4. Transfer `fee` to `task.feeTreasury`
+4. Transfer `fee` to `task.feeTreasury` in the same asset
 5. Emit `PlatformFeeCollected(taskId, fee, feeTreasury)`
 
 ---
 
 ## 7. Deposit Flow
 
-### Sequence
+### Sequence (Native PHRS)
 
 ```
-Creator                     iNeedEscrow
+Creator                     iNeedEscrowV2
    │                             │
-   │  1. createTask(metadata)    │
+   │  1. createTask(rewardAsset = address(0)) │
    │────────────────────────────►│  Assigns taskId, status = Created
    │                             │
    │  2. deposit(taskId)         │
    │     msg.value = rewardTotal │
-   │────────────────────────────►│  Locks funds, status = Funded → Open
+   │────────────────────────────►│  Locks native funds, status = Funded → Open
    │                             │  Emits TaskCreated, TaskFunded
 ```
 
-### Function Signature (abstract)
+### Sequence (ERC20 USDC)
+
+```
+Creator                     iNeedEscrowV2                   USDC Contract
+   │                             │                              │
+   │  1. createTask(rewardAsset = 0xE0BE...) │                  │
+   │────────────────────────────►│                              │
+   │                             │                              │
+   │  2. approve(escrow, amount) │                              │
+   │────────────────────────────────────────────────────────────►│
+   │                             │                              │
+   │  3. deposit(taskId)         │                              │
+   │────────────────────────────►│                              │
+   │                             │── transferFrom(creator, ────►│
+   │                             │    escrow, amount)            │
+   │                             │  Locks ERC20 funds           │
+   │                             │  Status = Funded → Open      │
+   │                             │  Emits TaskCreated, TaskFunded│
+```
+
+### Function Signature
 
 ```solidity
 function createTask(
@@ -349,7 +379,8 @@ function createTask(
     bytes calldata rewardConfig,
     WinnerSelection winnerSelection,
     uint256 deadline,
-    uint256 maxParticipants
+    uint256 maxParticipants,
+    address rewardAsset    // address(0) = native, otherwise ERC20
 ) external returns (uint256 taskId);
 
 function deposit(uint256 taskId) external payable;
@@ -358,7 +389,8 @@ function deposit(uint256 taskId) external payable;
 ### Validation
 
 - `createTask`: `rewardTotal > 0`, `deadline > block.timestamp`
-- `deposit`: `msg.value == task.rewardTotal`, caller is `task.creator`, task is in Created state
+- `deposit` (native): `msg.value == task.rewardTotal`, caller is `task.creator`, task is in Created state
+- `deposit` (ERC20): `msg.value == 0`, caller has approved sufficient allowance, task is in Created state
 - At creation, the current global `feeBps` and `feeTreasury` are snapshotted into the task — subsequent fee config changes do not affect this task
 
 ---
@@ -368,7 +400,7 @@ function deposit(uint256 taskId) external payable;
 ### Sequence
 
 ```
-Creator                     iNeedEscrow                 Winner(s)         Treasury
+Creator                     iNeedEscrowV2                 Winner(s)         Treasury
    │                             │                          │                 │
    │  1. selectWinners(id, [])  │                          │                 │
    │────────────────────────────►│  Marks isWinner flags   │                 │
@@ -378,24 +410,12 @@ Creator                     iNeedEscrow                 Winner(s)         Treasu
    │                             │  Calculate fee           │                 │
    │                             │  payoutPool = total - fee│                 │
    │                             │                          │                 │
-   │                             │── transfer(winnerAmt) ──►│                 │
+   │                             │── transfer(winnerAmt) ──►│ (same asset)    │
    │                             │                          │                 │
-   │                             │── transfer(fee) ────────────────────────►│
+   │                             │── transfer(fee) ────────────────────────►│ (same asset)
    │                             │  Emit RewardReleased     │                 │
    │                             │  Emit PlatformFeeCollected               │
    │                             │  Status → Completed     │                 │
-```
-
-### Function Signature (abstract)
-
-```solidity
-function selectWinners(
-    uint256 taskId,
-    address[] calldata winnerAddresses,
-    bytes calldata proof
-) external;
-
-function release(uint256 taskId) external;
 ```
 
 ### Release Internal Logic
@@ -403,16 +423,17 @@ function release(uint256 taskId) external;
 ```
 1. fee = calculateFee(task.rewardTotal)
 2. payoutPool = task.rewardTotal - fee
-3. For single winner:
+3. rewardAsset = task.rewardAsset
+4. For single winner:
      winnerAmount = payoutPool
-     transfer(winner, winnerAmount)
-4. For multiple winners (equal):
+     _safeTransferReward(rewardAsset, winner, winnerAmount)
+5. For multiple winners (equal):
      winnerAmount = payoutPool / numWinners
-     for each winner: transfer(winner, winnerAmount)
-5. For multiple winners (weighted):
-     for each winner: transfer(winner, payoutPool * weight_i / weightSum)
-6. transfer(task.feeTreasury, fee)
-7. task.status = Completed
+     for each winner: _safeTransferReward(rewardAsset, winner, winnerAmount)
+6. For multiple winners (weighted):
+     for each winner: _safeTransferReward(rewardAsset, winner, amount)
+7. _safeTransferReward(rewardAsset, task.feeTreasury, fee)
+8. task.status = Completed
 ```
 
 ### Validation
@@ -422,6 +443,7 @@ function release(uint256 taskId) external;
 - Cannot release more than the locked balance
 - Payout must leave enough balance for the platform fee
 - Fee is sent to the treasury address snapshotted in the task
+- All transfers use the same reward asset as the original deposit
 
 ---
 
@@ -430,12 +452,12 @@ function release(uint256 taskId) external;
 ### Sequence
 
 ```
-Creator                     iNeedEscrow
+Creator                     iNeedEscrowV2
    │                             │
    │  refund(taskId)             │
    │────────────────────────────►│
    │                             │  Validate cancellable state
-   │                             │  Transfer full balance to creator
+   │                             │  _safeTransferReward(rewardAsset, creator, amount)
    │                             │  Emit TaskRefunded
    │◄────────────────────────────│  Status → Cancelled
 ```
@@ -450,7 +472,7 @@ Creator                     iNeedEscrow
 | Submitted / Review | No | Work has been delivered |
 | Disputed | No | Must be resolved first |
 
-### Function Signature (abstract)
+### Function Signature
 
 ```solidity
 function refund(uint256 taskId) external;
@@ -460,7 +482,7 @@ function refund(uint256 taskId) external;
 
 - Caller is task creator
 - Task is in Funded or Open state (no participant has accepted)
-- Full balance transferred to creator (no fee deducted on refund)
+- Full balance transferred to creator in same asset (no fee deducted on refund)
 
 ---
 
@@ -475,10 +497,10 @@ function refund(uint256 taskId) external;
 4. Funds remain locked — no release or refund during dispute
 5. Admin reviews evidence (off-chain, via backend)
 6. Admin calls resolveDispute(taskId, ruling, ...)
-7. Funds released per ruling
+7. Funds released per ruling, all transfers in task's reward asset
 ```
 
-### Function Signatures (abstract)
+### Function Signatures
 
 ```solidity
 function raiseDispute(uint256 taskId, bytes calldata evidence) external;
@@ -495,7 +517,7 @@ function resolveDispute(
 
 Dispute resolution follows the same fee model as successful release:
 
-- **Payout to participant**: fee is deducted from the paid amount, treasury receives the fee
+- **Payout to participant**: fee is deducted from the paid amount, treasury receives the fee in the same asset
 - **Refund to creator**: full balance returned, no fee deducted
 - **Split**: fee is deducted from the participant's portion only
 
@@ -514,21 +536,15 @@ This ensures the platform fee is never applied to refunds — only to work that 
 - `raiseDispute`: any participant whose submission was not selected as winner
 - `resolveDispute`: admin address only (set at deploy time, changeable via multisig)
 
-### Guard Conditions
-
-- Task must be in Review or Disputed state
-- Can only resolve once per dispute
-- Admin cannot rule in their own favor (if admin is also a participant)
-
 ---
 
 ## 11. Events List
 
-All events emitted by `iNeedEscrow`.
+All events emitted by `iNeedEscrowV2`. Changes from V1 marked with ★.
 
 | Event | Parameters | Emitted When |
 |---|---|---|
-| `TaskCreated` | `taskId`, `creator`, `rewardTotal`, `deadline` | `createTask()` called |
+| `TaskCreated` ★ | `taskId`, `creator`, `rewardAsset`, `rewardTotal`, `deadline` | `createTask()` called |
 | `TaskFunded` | `taskId`, `amount` | `deposit()` confirmed |
 | `TaskAccepted` | `taskId`, `participant` | `accept()` called |
 | `SubmissionUploaded` | `taskId`, `submitter`, `contentHash` | `submit()` called |
@@ -549,29 +565,31 @@ All events emitted by `iNeedEscrow`.
 ### 12.1 Reentrancy
 
 - All external calls (transfers) happen at the end of functions (checks-effects-interactions pattern)
-- Use Solidity `ReentrancyGuard` for `release()`, `refund()`, and `resolveDispute()`
+- Use Solidity `nonReentrant` modifier for `release()`, `refund()`, and `resolveDispute()`, `autoResolve()`
 - `msg.value` is credited immediately on deposit — no callback risk at deposit time
+- For ERC20 deposits: `transferFrom` is called **after** state is updated — if it reverts, state changes are atomically rolled back
 
-### 12.2 Integer Overflow / Underflow
+### 12.2 Safe ERC20 Transfers
+
+- V2 uses a `_safeTransferReward` helper that safely handles both native and ERC20 transfers
+- For ERC20: uses low-level `call` with `abi.encodeCall` to avoid requiring a return value
+- Checks both `success` and optional return `bool` to handle tokens that don't return a value
+- For native: uses the same `call{value}` pattern as V1
+
+### 12.3 Integer Overflow / Underflow
 
 - Solidity 0.8+ has built-in overflow checking
 - Division in equal-split reward calculation: check `numWinners > 0` before dividing
 - Weighted split: check `weightSum > 0`, handle dust accumulation
 
-### 12.3 Access Control
+### 12.4 Access Control
 
 | Role | Addresses | Protected Functions |
 |---|---|---|
 | **Creator** | Single address per task | `deposit`, `selectWinners`, `release`, `refund` |
 | **Participant** | Addresses that called `accept` | `submit`, `raiseDispute` |
-| **Admin** | Set at deploy, multisig-controlled | `resolveDispute`, `setFeeBps`, `setFeeTreasury`, emergency pause |
+| **Admin** | Set at deploy | `resolveDispute`, `setFeeBps`, `setFeeTreasury` |
 | **Anyone** | Public | `accept`, `autoResolve` (after deadline) |
-
-### 12.4 Front-Running
-
-- `selectWinners`: commit-reveal pattern is not used for MVP — creator selection is trusted.
-- `autoResolve`: permissionless by design, no advantage to front-running.
-- `accept`: race condition possible if `maxParticipants` is small. Accept in same block — first tx wins.
 
 ### 12.5 Fund Locking Prevention
 
@@ -582,22 +600,18 @@ All events emitted by `iNeedEscrow`.
 ### 12.6 Platform Fee Safety
 
 - Fee deducted **only on successful reward release** — refunds return the full balance to creator
-- Global `maxFeeBps` (1000 bps = 10%) is set at deploy and is **immutable** — admin can never exceed this ceiling
+- Global `maxFeeBps` (1000 bps = 10%) is set at deploy and is **immutable**
 - `setFeeBps` enforces `newFeeBps ≤ maxFeeBps` or the transaction reverts
-- Fee percentage is **snapshotted** into each `Task` struct at creation — changing the global fee later has no effect on already-funded tasks
-- `feeTreasury` must be a non-zero address; setting zero address reverts
-- Fee is calculated deterministically from `task.rewardTotal`, not from dynamic balance — prevents manipulation via partial releases
-- Fee collection happens in the same transaction as winner payout — atomic: either both succeed or both revert
+- Fee percentage is **snapshotted** into each `Task` struct at creation
+- Fee collected in the **same asset** as the task reward
 
 ### 12.7 Denial of Service
 
 - `participants[]` and `submissions[]` arrays are bounded by `maxParticipants`
-- `release()` iterates over winner array — checked for reasonable upper bound in MVP
-- Gas limit consideration: winner payout loops should have a practical limit (e.g. 50 winners max)
+- Winner payout loops have a practical limit
 
-### 12.8 Upgrade & Migration
+### 12.8 V1 → V2 Migration
 
-- MVP contract is immutable (no proxy)
-- If critical bug is found, admin can pause new task creation
-- Funds in active tasks are at risk during migration — users must withdraw or resolve before migration
-- Post-MVP: UUPS proxy pattern with timelocked upgrade
+- V2 is a new deployment (not a proxy upgrade)
+- V1 tasks continue to run on the old contract with no changes
+- Users must complete or withdraw from V1 tasks before V1 is deprecated
